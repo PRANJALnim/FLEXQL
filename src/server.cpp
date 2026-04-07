@@ -72,6 +72,23 @@ struct Arena {
         uint64_t id=((uint64_t)(slabs.size()-1)<<32)|(uint32_t)s.used;
         memcpy(s.data+s.used,d,l); s.used+=l; return id;
     }
+    inline uint64_t appendUninit(uint32_t l, char **out) {
+        if(!l){ if(out) *out=nullptr; return ~0ULL; }
+        if(__builtin_expect(slabs.back().used+l>SLAB_SZ,0)) addSlab();
+        auto &s=slabs.back();
+        uint64_t id=((uint64_t)(slabs.size()-1)<<32)|(uint32_t)s.used;
+        if(out) *out=s.data+s.used;
+        s.used+=l;
+        return id;
+    }
+    inline uint64_t appendFromFile(FILE *fp, uint32_t l) {
+        if(!l) return ~0ULL;
+        char *dst=nullptr;
+        uint64_t id=appendUninit(l,&dst);
+        if(!dst) return ~0ULL;
+        if(fread(dst,1,l,fp)!=l) throw std::runtime_error("snapshot read failed");
+        return id;
+    }
     inline const char *ptr(uint64_t id) const {
         if(__builtin_expect(id==~0ULL,0)) return "";
         return slabs[id>>32].data+(uint32_t)(id&0xFFFFFFFF);
@@ -253,6 +270,7 @@ static std::unordered_map<std::string,Table> gDB;
 static Cache gCache;
 static WAL   gWAL;
 static std::mutex gMu;
+static std::atomic<uint64_t> gWALRecords{0};
 
 static bool fileExists(const char *path){
     struct stat st{};
@@ -351,11 +369,10 @@ static bool loadSnapshot(){
                 if(l==0){
                     T.cells.push(~0ULL,0);
                 } else {
-                    std::string buf; buf.assign(l,'\0');
-                    ok = ok && fread(&buf[0],1,l,fp)==l;
-                    if(!ok) break;
-                    uint64_t id=T.arena.append(buf.data(),l);
-                    T.cells.push(id,l);
+                    try{
+                        uint64_t id=T.arena.appendFromFile(fp,l);
+                        T.cells.push(id,l);
+                    }catch(...){ ok=false; break; }
                 }
             }
         }
@@ -374,8 +391,7 @@ static bool loadSnapshot(){
 }
 
 static void checkpointIfNeeded(){
-    auto recs=gWAL.readAll(WAL_FILE);
-    if(recs.size() < CHECKPOINT_WAL_RECORDS) return;
+    if(gWALRecords.load(std::memory_order_relaxed) < (uint64_t)CHECKPOINT_WAL_RECORDS) return;
     {
         std::lock_guard<std::mutex> lk(gMu);
         if(!saveSnapshotLocked()) return;
@@ -395,6 +411,7 @@ static void checkpointIfNeeded(){
         }
         gWAL.used[0]=gWAL.used[1]=0;
     }
+    gWALRecords.store(0, std::memory_order_relaxed);
 }
 
 /* ── Helpers ── */
@@ -708,7 +725,7 @@ static std::string doInsert(const char *sql,size_t sqlLen,bool walWrite){
     gCache.inv(nm);
     parseInsertInto(p,end,tbl.nc,tbl.arena,tbl.cells);
     tbl.idxDirty=true;
-    if(walWrite) gWAL.append(sql,sqlLen);
+    if(walWrite){ gWAL.append(sql,sqlLen); gWALRecords.fetch_add(1, std::memory_order_relaxed); }
     return "OK\nEND\n";
 }
 
@@ -719,7 +736,7 @@ static void doDelete(Parser &p,const std::string &sql,bool walWrite){
     auto it=gDB.find(nm);
     if(it==gDB.end())throw std::runtime_error("No such table: "+nm);
     Table &tbl=it->second;
-    if(walWrite) gWAL.append(sql.c_str(),sql.size());
+    if(walWrite){ gWAL.append(sql.c_str(),sql.size()); gWALRecords.fetch_add(1, std::memory_order_relaxed); }
     gCache.inv(nm);
     WC w=parseWhere(p);
     if(!w.on){tbl.clear();return;}
@@ -752,8 +769,9 @@ static std::string doSelect(Parser &p, const std::string &sql){
     Table &T1=it1->second;
 
     bool hasJ=false; std::string jc1,jc2,jo,t2nm; Table *T2=nullptr;
-    if(p.kw("INNER")||p.kw("LEFT")||p.kw("RIGHT")||p.kw("CROSS")){
-        p.con();if(p.kw("JOIN"))p.con();
+    if(p.kw("JOIN")||p.kw("INNER")||p.kw("LEFT")||p.kw("RIGHT")||p.kw("CROSS")){
+        if(!p.kw("JOIN")) p.con();
+        if(p.kw("JOIN")) p.con();
         t2nm=p.exId().v;
         auto it2=gDB.find(t2nm);
         if(it2==gDB.end())throw std::runtime_error("No such table: "+t2nm);
@@ -950,7 +968,7 @@ static std::string execSQL(const char *raw,size_t rawLen,bool walWrite=true){
             std::string sub=p.exId().v;
             if(sub=="TABLE") doCreate(p);
             else throw std::runtime_error("Unknown CREATE: "+sub);
-            if(walWrite) gWAL.append(raw,rawLen);
+            if(walWrite){ gWAL.append(raw,rawLen); gWALRecords.fetch_add(1, std::memory_order_relaxed); }
         }
         else if(kw=="DELETE"){
             doDelete(p,std::string(raw,rawLen),walWrite);
@@ -965,7 +983,7 @@ static std::string execSQL(const char *raw,size_t rawLen,bool walWrite=true){
             std::string nm=p.exId().v;
             if(!ine2&&!gDB.count(nm))throw std::runtime_error("No such table: "+nm);
             gDB.erase(nm); gCache.inv(nm);
-            if(walWrite) gWAL.append(raw,rawLen);
+            if(walWrite){ gWAL.append(raw,rawLen); gWALRecords.fetch_add(1, std::memory_order_relaxed); }
         }
         else{ throw std::runtime_error("Unknown command: "+kw); }
         return rows+"OK\nEND\n";
@@ -975,10 +993,23 @@ static std::string execSQL(const char *raw,size_t rawLen,bool walWrite=true){
 }
 
 static void replayWAL(){
-    auto recs=gWAL.readAll(WAL_FILE);
-    if(recs.empty())return;
-    std::cout<<"[WAL] replaying "<<recs.size()<<" records...\n";
-    for(auto &sql:recs){ try{execSQL(sql.c_str(),sql.size(),false);}catch(...){} }
+    FILE *r=fopen(WAL_FILE,"rb");
+    if(!r) return;
+    std::cout<<"[WAL] replaying...\n";
+    size_t recs=0;
+    for(;;){
+        uint32_t len=0;
+        if(fread(&len,1,4,r)!=4) break;
+        std::string sql(len,'\0');
+        if(len>0 && fread(&sql[0],1,len,r)!=len) break;
+        fgetc(r);
+        ++recs;
+        try{ execSQL(sql.c_str(),sql.size(),false); }catch(...){ }
+        if((recs%200000)==0) std::cout<<"[WAL] replayed "<<recs<<" records...\n";
+    }
+    fclose(r);
+    gWALRecords.store((uint64_t)recs, std::memory_order_relaxed);
+    std::cout<<"[WAL] replayed "<<recs<<" records\n";
     std::cout<<"[WAL] done\n";
 }
 
