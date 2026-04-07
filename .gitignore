@@ -1,0 +1,5 @@
+server
+benchmark
+flexql_data/
+*.o
+*.log
